@@ -23,6 +23,10 @@ if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
 }
+if (!/^https?:\/\//.test(ENV_URL)) {
+  process.stderr.write(`[entry] MAKEFUN_ENV_URL must start with http:// or https://, got: ${ENV_URL}\n`);
+  process.exit(1);
+}
 
 /** How long one register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
