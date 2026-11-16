@@ -22,14 +22,13 @@ import {
 
 export const AGENT = 'github-forge/1.0';
 
+/** Split pack bytes into sideband band-1 packets (pkt-line max 65520 bytes). */
 function sidebandPackets(data: Buffer): Buffer[] {
-  // Split pack bytes into sideband band-1 packets (pkt-line max 65520 bytes).
   const out: Buffer[] = [];
   const maxChunk = 65520 - 5; // 4 (pkt len) + 1 (band byte)
   for (let off = 0; off < data.length || out.length === 0; off += maxChunk) {
     const chunk = data.subarray(off, Math.min(data.length, off + maxChunk));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    out.push(pktLine(payload));
+    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
     if (data.length === 0) break;
   }
   return out;
@@ -37,9 +36,12 @@ function sidebandPackets(data: Buffer): Buffer[] {
 
 /** Sorted ref names for advertisement / ls-refs. */
 function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
-  return [...repo.refs.entries()].map(([name, oid]) => ({ name, oid })).sort((a, b) => (a.name < b.name ? -1 : 1));
+  return [...repo.refs.entries()]
+    .map(([name, oid]) => ({ name, oid }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
+/** The tip of the repo's default branch, or null when unborn. */
 function headOid(repo: Repo): string | null {
   return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? null;
 }
@@ -56,8 +58,7 @@ export function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-re
   if (head === null && refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
-    const headLine = head === null ? `${ZERO_OID} HEAD\0${caps}\n` : `${head} HEAD\0${caps}\n`;
-    parts.push(pktLine(headLine));
+    parts.push(pktLine(`${head === null ? ZERO_OID : head} HEAD\0${caps}\n`));
     for (const ref of refs) {
       parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
       // Peeled line for annotated tag refs: the target commit, never the tag itself.
@@ -119,12 +120,6 @@ export interface FetchRequest {
 }
 
 /**
- * v2 fetch response. Sections are emitted ONLY when they carry content — real git
- * expects `packfile` first when the client sent no haves and no depth, and reads
- * `acknowledgments` only when it sent haves. `wanted-refs` is omitted (neither real
- * git nor the kit's client requires it).
- */
-/**
  * Resolve the effective fetch depth. The kit's client sends `deepen N` as the ABSOLUTE
  * depth it wants, while real git's `--deepen N` sends N as an INCREMENT over the
  * client's current depth. The two are told apart by shape: a pure deepen re-requests
@@ -139,8 +134,8 @@ function effectiveDepth(repo: Repo, req: FetchRequest): number | null {
   const queue: Array<{ oid: string; gen: number }> = req.wants.map((oid) => ({ oid, gen: 0 }));
   const seen = new Set<string>();
   const boundarySet = new Set(req.shallow);
-  while (queue.length > 0) {
-    const { oid, gen } = queue.shift() as { oid: string; gen: number };
+  for (let head = 0; head < queue.length; head += 1) {
+    const { oid, gen } = queue[head] as { oid: string; gen: number };
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (boundarySet.has(oid)) {
@@ -158,6 +153,12 @@ function effectiveDepth(repo: Repo, req: FetchRequest): number | null {
   return req.depth;
 }
 
+/**
+ * v2 fetch response. Sections are emitted ONLY when they carry content — real git
+ * expects `packfile` first when the client sent no haves and no depth, and reads
+ * `acknowledgments` only when it sent haves. `wanted-refs` is omitted (neither real
+ * git nor the kit's client requires it).
+ */
 export function v2Fetch(repo: Repo, req: FetchRequest): Buffer {
   const depth = effectiveDepth(repo, req);
   const { objects, shallow, unshallow } = collectFetchObjects(repo, req.wants, new Set(req.haves), depth, new Set(req.shallow));

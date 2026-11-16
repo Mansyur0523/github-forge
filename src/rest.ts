@@ -1,24 +1,27 @@
 // rest.ts — GitHub REST v3 (/api/v3): repos, branches, commits, contents, git refs,
 // issues, comments, labels, pull requests and merges. Every reply is application/json
 // with a non-empty X-GitHub-Request-Id; errors carry {message}.
+//
+// Performance notes:
+// - The two hottest single-object replies (GET issue, GET repo) are served from a
+//   cache of the exact serialised bytes, keyed by (object, Host header). An issue
+//   or repo changes only through its own mutation handlers, and every one of
+//   those drops the cached bytes first, so a cached reply is always current.
+//   Labels are immutable once created and timestamps are deterministic per
+//   sequence number, so nothing else can make a cached rendering stale.
+// - The commit list walk uses an index-based queue, not shift().
 
 import type { IncomingMessage } from 'node:http';
 import type { Label, Pull, Repo, Store } from './store.ts';
 import { VIEWER_ID, VIEWER_LOGIN, isOid } from './store.ts';
 import {
   blobAtPath,
-  buildCommit,
-  buildTree,
+  cachedTree,
   diffTrees,
-  flattenTree,
   getCommit,
   getObject,
-  hashObject,
-  isAncestor,
   makeCommit,
   mergeBase,
-  parseCommit,
-  parseTree,
   setPathInTree,
   storeObject,
   threeWayMerge,
@@ -70,6 +73,11 @@ function originOf(ctx: Ctx): string {
   return `http://${host}`;
 }
 
+/** The cache key for a serialised rendering: the Host header (URLs embed it). */
+function hostOf(ctx: Ctx): string {
+  return ctx.req.headers.host ?? '127.0.0.1';
+}
+
 function pageParams(ctx: Ctx): { page: number; perPage: number } {
   const page = Math.max(1, parseInt(ctx.query.get('page') ?? '1', 10) || 1);
   const perPage = Math.min(100, Math.max(1, parseInt(ctx.query.get('per_page') ?? '30', 10) || 30));
@@ -88,6 +96,8 @@ export interface RestResult {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialised reply (JSON + "\n") with its byte length: send as-is, no re-stringify. */
+  raw?: { text: string; length: number };
 }
 
 function linkHeader(ctx: Ctx, basePath: string, page: number, perPage: number, pageCount: number): string | null {
@@ -100,8 +110,50 @@ function linkHeader(ctx: Ctx, basePath: string, page: number, perPage: number, p
 }
 
 // -------------------------------------------------------------------------------------------
-// JSON shapes
+// JSON shapes (+ cached serialisations for the two hottest single-object replies)
 // -------------------------------------------------------------------------------------------
+
+/** Serialised text + byte length of a JSON value, exactly as sendJson would write it. */
+function serialised(body: unknown): { text: string; length: number } {
+  const text = `${JSON.stringify(body)}\n`;
+  return { text, length: Buffer.byteLength(text) };
+}
+
+const issueTextCache = new WeakMap<object, Map<string, { text: string; length: number; fp: string }>>();
+const repoTextCache = new WeakMap<object, Map<string, { text: string; length: number; fp: string }>>();
+
+function cachedText(
+  cache: WeakMap<object, Map<string, { text: string; length: number; fp: string }>>,
+  key: object,
+  host: string,
+  fp: string,
+  build: () => unknown,
+): { text: string; length: number } {
+  let perHost = cache.get(key);
+  if (perHost === undefined) {
+    perHost = new Map();
+    cache.set(key, perHost);
+  }
+  let hit = perHost.get(host);
+  // The fingerprint covers every field the rendering embeds. Any mutation —
+  // through REST, GraphQL or MCP — changes it, so a cached reply is always
+  // current even when the mutation bypassed this module's drop calls.
+  if (hit === undefined || hit.fp !== fp) {
+    hit = { ...serialised(build()), fp };
+    perHost.set(host, hit);
+  }
+  return hit;
+}
+
+/** Drop every cached rendering of an issue (call before mutating it). */
+function dropIssueText(issue: object): void {
+  issueTextCache.delete(issue);
+}
+
+/** Drop every cached rendering of a repo (call before mutating it). */
+function dropRepoText(repo: object): void {
+  repoTextCache.delete(repo);
+}
 
 export function userJson(login: string): Record<string, unknown> {
   return { login, id: VIEWER_ID, node_id: '', avatar_url: '', type: 'User', site_admin: false };
@@ -135,11 +187,30 @@ export function repoJson(ctx: Ctx, repo: Repo): Record<string, unknown> {
   };
 }
 
+/** Cached serialised repo JSON for single-repo replies. */
+function repoText(ctx: Ctx, repo: Repo): { text: string; length: number } {
+  const fp = `${repo.id}|${repo.name}|${repo.owner}|${repo.description}|${repo.isPrivate}|${repo.defaultBranch}|${repo.createdSeq}`;
+  return cachedText(repoTextCache, repo, hostOf(ctx), fp, () => repoJson(ctx, repo));
+}
+
 export function labelJson(label: Label): Record<string, unknown> {
   return { id: label.id, name: label.name, color: label.color, description: label.description, default: false };
 }
 
-export function issueJson(ctx: Ctx, repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: string[]; user: string; createdSeq: number; updatedSeq: number; comments: Array<{ id: number }> }): Record<string, unknown> {
+export type IssueShape = {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: string;
+  labels: string[];
+  user: string;
+  createdSeq: number;
+  updatedSeq: number;
+  comments: Array<{ id: number }>;
+};
+
+export function issueJson(ctx: Ctx, repo: Repo, issue: IssueShape): Record<string, unknown> {
   return {
     id: issue.id,
     number: issue.number,
@@ -158,6 +229,12 @@ export function issueJson(ctx: Ctx, repo: Repo, issue: { id: number; number: num
     html_url: `${originOf(ctx)}/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `${originOf(ctx)}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/** Cached serialised issue JSON for single-issue replies. */
+function issueText(ctx: Ctx, repo: Repo, issue: IssueShape): { text: string; length: number } {
+  const fp = `${issue.updatedSeq}|${issue.state}|${issue.title}|${issue.body}|${issue.labels.join(',')}|${issue.comments.length}`;
+  return cachedText(issueTextCache, issue, hostOf(ctx), fp, () => issueJson(ctx, repo, issue));
 }
 
 export function pullJson(ctx: Ctx, repo: Repo, pull: Pull): Record<string, unknown> {
@@ -314,10 +391,8 @@ function contentFileJson(ctx: Ctx, repo: Repo, path: string, blobOid: string, re
 }
 
 function dirEntries(ctx: Ctx, repo: Repo, treeOid: string, dirPath: string): Array<Record<string, unknown>> {
-  const obj = getObject(repo, treeOid);
-  if (!obj || obj.type !== 'tree') return [];
   const out: Array<Record<string, unknown>> = [];
-  for (const entry of parseTree(obj.data)) {
+  for (const entry of cachedTree(repo, treeOid)) {
     const path = dirPath === '' ? entry.name : `${dirPath}/${entry.name}`;
     if (entry.mode === '40000') {
       out.push({
@@ -386,7 +461,7 @@ export function handleCreateRepo(ctx: Ctx): RestResult {
   if (name === '' || !/^[A-Za-z0-9_.-]+$/.test(name)) throw unprocessable('Invalid repository name');
   if (ctx.store.getRepo(VIEWER_LOGIN, name)) throw unprocessable('Repository already exists');
   const repo = ctx.store.createRepo(name, str(ctx.body.description), ctx.body.private === true);
-  return { status: 201, body: repoJson(ctx, repo) };
+  return { status: 201, body: null, raw: repoText(ctx, repo) };
 }
 
 export function handleListUserRepos(ctx: Ctx): RestResult {
@@ -401,12 +476,14 @@ export function handleListUserRepos(ctx: Ctx): RestResult {
 }
 
 export function handleGetRepo(ctx: Ctx, owner: string, name: string): RestResult {
-  return { status: 200, body: repoJson(ctx, requireRepo(ctx, owner, name)) };
+  const repo = requireRepo(ctx, owner, name);
+  return { status: 200, body: null, raw: repoText(ctx, repo) };
 }
 
 export function handlePatchRepo(ctx: Ctx, owner: string, name: string): RestResult {
   const repo = requireRepo(ctx, owner, name);
   if (!isRecord(ctx.body)) throw badRequest('body must be a JSON object');
+  dropRepoText(repo);
   const newName = optStr(ctx.body.name);
   if (newName !== undefined && newName !== repo.name) {
     if (!/^[A-Za-z0-9_.-]+$/.test(newName)) throw unprocessable('Invalid repository name');
@@ -418,11 +495,12 @@ export function handlePatchRepo(ctx: Ctx, owner: string, name: string): RestResu
   const defaultBranch = optStr(ctx.body.default_branch);
   if (defaultBranch !== undefined && repo.refs.has(`refs/heads/${defaultBranch}`)) repo.defaultBranch = defaultBranch;
   if (typeof ctx.body.private === 'boolean') repo.isPrivate = ctx.body.private;
-  return { status: 200, body: repoJson(ctx, repo) };
+  return { status: 200, body: null, raw: repoText(ctx, repo) };
 }
 
 export function handleDeleteRepo(ctx: Ctx, owner: string, name: string): RestResult {
   const repo = requireRepo(ctx, owner, name);
+  dropRepoText(repo);
   ctx.store.deleteRepo(repo);
   return { status: 204, body: null };
 }
@@ -453,8 +531,8 @@ export function handleListCommits(ctx: Ctx, owner: string, name: string): RestRe
   const commits: string[] = [];
   const seen = new Set<string>();
   const queue = [tip];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const commit = getCommit(repo, oid);
@@ -504,9 +582,7 @@ export function handleGetContents(ctx: Ctx, owner: string, name: string, path: s
   for (let i = 0; i < segments.length; i += 1) {
     const seg = segments[i] as string;
     currentPath = currentPath === '' ? seg : `${currentPath}/${seg}`;
-    const obj = getObject(repo, currentTree);
-    if (!obj || obj.type !== 'tree') throw notFound('Not Found');
-    const entry = parseTree(obj.data).find((e) => e.name === seg);
+    const entry = cachedTree(repo, currentTree).find((e) => e.name === seg);
     if (!entry) throw notFound('Not Found');
     if (i === segments.length - 1) {
       if (entry.mode === '40000') return { status: 200, body: dirEntries(ctx, repo, entry.oid, currentPath) };
@@ -584,7 +660,7 @@ export function handleCreateIssue(ctx: Ctx, owner: string, name: string): RestRe
     if (!repo.labels.has(labelName)) throw unprocessable(`Label does not exist: ${labelName}`);
   }
   const issue = ctx.store.createIssue(repo, title, str(ctx.body.body), labels);
-  return { status: 201, body: issueJson(ctx, repo, issue) };
+  return { status: 201, body: null, raw: issueText(ctx, repo, issue) };
 }
 
 export function handleListIssues(ctx: Ctx, owner: string, name: string): RestResult {
@@ -605,7 +681,7 @@ export function handleGetIssue(ctx: Ctx, owner: string, name: string, number: nu
   const repo = requireRepo(ctx, owner, name);
   const issue = repo.issues.get(number);
   if (!issue) throw notFound('Issue not found');
-  return { status: 200, body: issueJson(ctx, repo, issue) };
+  return { status: 200, body: null, raw: issueText(ctx, repo, issue) };
 }
 
 export function handlePatchIssue(ctx: Ctx, owner: string, name: string, number: number): RestResult {
@@ -613,6 +689,7 @@ export function handlePatchIssue(ctx: Ctx, owner: string, name: string, number: 
   const issue = repo.issues.get(number);
   if (!issue) throw notFound('Issue not found');
   if (!isRecord(ctx.body)) throw badRequest('body must be a JSON object');
+  dropIssueText(issue);
   const title = optStr(ctx.body.title);
   if (title !== undefined) issue.title = title;
   const body = optStr(ctx.body.body);
@@ -625,7 +702,7 @@ export function handlePatchIssue(ctx: Ctx, owner: string, name: string, number: 
     issue.labels = labels;
   }
   issue.updatedSeq = ctx.store.nextSeq();
-  return { status: 200, body: issueJson(ctx, repo, issue) };
+  return { status: 200, body: null, raw: issueText(ctx, repo, issue) };
 }
 
 export function handleListComments(ctx: Ctx, owner: string, name: string, number: number): RestResult {
@@ -646,6 +723,7 @@ export function handleCreateComment(ctx: Ctx, owner: string, name: string, numbe
   if (!isRecord(ctx.body)) throw badRequest('body must be a JSON object');
   const body = str(ctx.body.body);
   if (body === '') throw unprocessable('Comment body is required');
+  dropIssueText(issue);
   const comment = ctx.store.createComment(repo, issue, body);
   return {
     status: 201,
@@ -660,6 +738,7 @@ export function handleAddIssueLabels(ctx: Ctx, owner: string, name: string, numb
   if (!isRecord(ctx.body)) throw badRequest('body must be a JSON object');
   const labels = Array.isArray(ctx.body.labels) ? ctx.body.labels.map((l) => String(l)) : [];
   for (const labelName of labels) if (!repo.labels.has(labelName)) throw unprocessable(`Label does not exist: ${labelName}`);
+  dropIssueText(issue);
   for (const labelName of labels) if (!issue.labels.includes(labelName)) issue.labels.push(labelName);
   issue.updatedSeq = ctx.store.nextSeq();
   return { status: 200, body: issue.labels.map((n) => labelJson(repo.labels.get(n) as Label)) };

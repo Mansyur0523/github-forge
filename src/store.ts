@@ -1,15 +1,24 @@
 // store.ts — the forge's in-memory state.
 //
-// One process, one store, no persistence: a trial runs against a fresh, empty forge and the
-// replay pass re-runs the same requests in the same order, so everything here is deterministic:
-// timestamps come from MAKEFUN_TRIAL_NOW plus a monotonic sequence (never Date.now()), ids are
-// counters (never Math.random()), and the viewer login is the scenario's fixed viewer
+// One process, one store, no persistence. A trial runs against a fresh, empty
+// forge and the replay pass re-runs the same requests in the same order, so
+// everything here is deterministic: timestamps come from MAKEFUN_TRIAL_NOW
+// plus a monotonic sequence (never Date.now()), ids are counters (never
+// Math.random()), and the viewer login is the scenario's fixed viewer
 // (SCENARIO_SEED is a constant in the kit: viewer login "adaiversen", id 1000).
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
+/** True when `value` is a 40-hex-char object id. */
 export function isOid(value: unknown): value is string {
-  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+  if (typeof value !== 'string' || value.length !== 40) return false;
+  for (let i = 0; i < 40; i += 1) {
+    const c = value.charCodeAt(i);
+    const digit = c >= 48 && c <= 57;
+    const lower = c >= 97 && c <= 102;
+    if (!digit && !lower) return false;
+  }
+  return true;
 }
 
 /** The token owner's login, from the kit's fixed scenario seed (wire.ts SCENARIO_SEED). */
@@ -94,11 +103,14 @@ export interface Repo {
   nextCommentId: number;
 }
 
+/** Parse MAKEFUN_TRIAL_NOW (seconds, or milliseconds, or an ISO date) into epoch seconds. */
 function parseTrialNow(): number {
   const raw = process.env.MAKEFUN_TRIAL_NOW ?? '';
   if (raw !== '') {
     const asNumber = Number(raw);
-    if (Number.isFinite(asNumber) && asNumber > 0) return asNumber > 1e12 ? Math.floor(asNumber / 1000) : Math.floor(asNumber);
+    if (Number.isFinite(asNumber) && asNumber > 0) {
+      return asNumber > 1e12 ? Math.floor(asNumber / 1000) : Math.floor(asNumber);
+    }
     const parsed = Date.parse(raw);
     if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
   }
@@ -113,6 +125,8 @@ export class Store {
   nextGlobalId = 1;
   nextRequestId = 1;
   readonly epochSec: number = parseTrialNow();
+  /** Memoised ISO timestamps: one seq always renders the same string, so render it once. */
+  private readonly tsCache = new Map<number, string>();
 
   key(owner: string, name: string): string {
     return `${owner}/${name}`;
@@ -124,7 +138,12 @@ export class Store {
 
   /** ISO timestamp for a sequence number: deterministic across replays. */
   ts(seq: number): string {
-    return new Date((this.epochSec + seq) * 1000).toISOString();
+    let out = this.tsCache.get(seq);
+    if (out === undefined) {
+      out = new Date((this.epochSec + seq) * 1000).toISOString();
+      this.tsCache.set(seq, out);
+    }
+    return out;
   }
 
   nextSeq(): number {
@@ -199,7 +218,17 @@ export class Store {
     return comment;
   }
 
-  createPull(repo: Repo, title: string, body: string, headRef: string, headSha: string, baseRef: string, baseSha: string, files: PullFile[], mergeBase: string | null): Pull {
+  createPull(
+    repo: Repo,
+    title: string,
+    body: string,
+    headRef: string,
+    headSha: string,
+    baseRef: string,
+    baseSha: string,
+    files: PullFile[],
+    mergeBase: string | null,
+  ): Pull {
     const seq = this.nextSeq();
     const pull: Pull = {
       id: this.nextGlobalId,
@@ -241,11 +270,12 @@ export function expectedToken(): string {
 
 /** Whether the Authorization header carries the trial token. */
 export function authorized(authorization: string | string[] | undefined): boolean {
-  const expected = expectedToken();
   if (typeof authorization !== 'string') return false;
-  const match = /^Bearer (.+)$/.exec(authorization.trim());
-  if (match === null) return false;
-  const presented = match[1] ?? '';
+  const trimmed = authorization.trim();
+  // "Bearer " + at least one char, exactly like /^Bearer (.+)$/ on the trimmed value.
+  if (!trimmed.startsWith('Bearer ') || trimmed.length === 7) return false;
+  const presented = trimmed.slice(7);
+  const expected = expectedToken();
   if (expected === '') return presented !== '';
   return presented === expected;
 }
